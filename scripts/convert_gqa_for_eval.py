@@ -14,5 +14,6 @@ for line_idx, line in enumerate(open(args.src)):
     text = res['text'].rstrip('.').lower()
     all_answers.append({"questionId": question_id, "prediction": text})
 
+os.makedirs(os.path.dirname(args.dst), exist_ok=True)
 with open(args.dst, 'w') as f:
     json.dump(all_answers, f)

@@ -24,4 +24,5 @@ if __name__ == "__main__":
         pred = json.loads(pred)
         cur_df.loc[df['index'] == pred['question_id'], 'prediction'] = pred['text']
 
+    os.makedirs(args.upload_dir, exist_ok=True)
     cur_df.to_excel(os.path.join(args.upload_dir, f"{args.experiment}.xlsx"), index=False, engine='openpyxl')
