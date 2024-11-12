@@ -95,6 +95,8 @@ def eval_model(args):
 
     data_loader = create_data_loader(questions, args.image_folder, tokenizer, image_processor, model.config)
 
+    num_tokens = []
+    data_bar = tqdm(zip(data_loader, questions), total=len(questions))
     for (input_ids, image_tensor, image_sizes), line in tqdm(zip(data_loader, questions), total=len(questions)):
         idx = line["question_id"]
         cur_prompt = line["text"]
@@ -102,9 +104,9 @@ def eval_model(args):
         input_ids = input_ids.to(device='cuda', non_blocking=True)
         with torch.inference_mode():
             if args.sparse:
-                output_ids = model.generate(
+                output_ids, v_token_num = model.generate(
                     args.scale,
-                    args.bias,
+                    args.shift,
                     input_ids,
                     images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
                     image_sizes=image_sizes,
@@ -114,6 +116,8 @@ def eval_model(args):
                     num_beams=args.num_beams,
                     max_new_tokens=args.max_new_tokens,
                     use_cache=True)
+                num_tokens.append(v_token_num)
+                data_bar.set_postfix({"token_num": v_token_num})
             else:
                 output_ids = model.generate(
                     input_ids,
@@ -137,6 +141,8 @@ def eval_model(args):
                                    "metadata": {}}) + "\n")
         # ans_file.flush()
     ans_file.close()
+    avg_num_tokens = sum(num_tokens) / len(num_tokens)
+    print(f"Average number of visual tokens: {avg_num_tokens}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -152,10 +158,9 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=128)
-    
     parser.add_argument("--sparse", action="store_true", help="sparse flag")
     parser.add_argument("--scale", type=float, default=13.5)
-    parser.add_argument("--bias", type=float, default=0)
+    parser.add_argument("--shift", type=float, default=0)
     args = parser.parse_args()
 
     eval_model(args)

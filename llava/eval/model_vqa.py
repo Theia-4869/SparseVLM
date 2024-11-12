@@ -31,14 +31,17 @@ def eval_model(args):
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, args.sparse)
 
     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
     ans_file = open(answers_file, "w")
-    for line in tqdm(questions):
+
+    num_tokens = []
+    question_bar = tqdm(questions)
+    for line in question_bar:
         idx = line["question_id"]
         image_file = line["image"]
         qs = line["text"]
@@ -59,17 +62,34 @@ def eval_model(args):
         image_tensor = process_images([image], image_processor, model.config)[0]
 
         with torch.inference_mode():
-            output_ids = model.generate(
-                input_ids,
-                images=image_tensor.unsqueeze(0).half().cuda(),
-                image_sizes=[image.size],
-                do_sample=True if args.temperature > 0 else False,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                num_beams=args.num_beams,
-                # no_repeat_ngram_size=3,
-                max_new_tokens=1024,
-                use_cache=True)
+            if args.sparse:
+                output_ids, v_token_num = model.generate(
+                    args.scale,
+                    args.shift,
+                    input_ids,
+                    images=image_tensor.unsqueeze(0).half().cuda(),
+                    image_sizes=[image.size],
+                    do_sample=True if args.temperature > 0 else False,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    # no_repeat_ngram_size=3,
+                    max_new_tokens=1024,
+                    use_cache=True)
+                num_tokens.append(v_token_num)
+                question_bar.set_postfix({"token_num": v_token_num})
+            else:
+                output_ids, v_token_num = model.generate(
+                    input_ids,
+                    images=image_tensor.unsqueeze(0).half().cuda(),
+                    image_sizes=[image.size],
+                    do_sample=True if args.temperature > 0 else False,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    num_beams=args.num_beams,
+                    # no_repeat_ngram_size=3,
+                    max_new_tokens=1024,
+                    use_cache=True)
 
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
@@ -82,6 +102,8 @@ def eval_model(args):
                                    "metadata": {}}) + "\n")
         ans_file.flush()
     ans_file.close()
+    avg_num_tokens = sum(num_tokens) / len(num_tokens)
+    print(f"Average number of visual tokens: {avg_num_tokens}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -96,6 +118,9 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--sparse", action="store_true", help="sparse flag")
+    parser.add_argument("--scale", type=float, default=13.5)
+    parser.add_argument("--shift", type=float, default=0)
     args = parser.parse_args()
 
     eval_model(args)

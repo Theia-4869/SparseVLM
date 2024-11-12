@@ -56,7 +56,7 @@ def eval_model(args):
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name, args.sparse)
 
     questions = pd.read_table(os.path.expanduser(args.question_file))
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
@@ -68,7 +68,9 @@ def eval_model(args):
         args.conv_mode = args.conv_mode + '_mmtag'
         print(f'It seems that this is a plain model, but it is not using a mmtag prompt, auto switching to {args.conv_mode}.')
 
-    for index, row in tqdm(questions.iterrows(), total=len(questions)):
+    num_tokens = []
+    question_bar = tqdm(questions.iterrows(), total=len(questions))
+    for index, row in question_bar:
         options = get_options(row, all_options)
         cur_option_char = all_options[:len(options)]
 
@@ -108,17 +110,34 @@ def eval_model(args):
             image_tensor = process_images([image], image_processor, model.config)[0]
 
             with torch.inference_mode():
-                output_ids = model.generate(
-                    input_ids,
-                    images=image_tensor.unsqueeze(0).half().cuda(),
-                    image_sizes=[image.size],
-                    do_sample=True if args.temperature > 0 else False,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    num_beams=args.num_beams,
-                    # no_repeat_ngram_size=3,
-                    max_new_tokens=1024,
-                    use_cache=True)
+                if args.sparse:
+                    output_ids, v_token_num = model.generate(
+                        args.scale,
+                        args.shift,
+                        input_ids,
+                        images=image_tensor.unsqueeze(0).half().cuda(),
+                        image_sizes=[image.size],
+                        do_sample=True if args.temperature > 0 else False,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        num_beams=args.num_beams,
+                        # no_repeat_ngram_size=3,
+                        max_new_tokens=1024,
+                        use_cache=True)
+                    num_tokens.append(v_token_num)
+                    question_bar.set_postfix({"token_num": v_token_num})
+                else:
+                    output_ids = model.generate(
+                        input_ids,
+                        images=image_tensor.unsqueeze(0).half().cuda(),
+                        image_sizes=[image.size],
+                        do_sample=True if args.temperature > 0 else False,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        num_beams=args.num_beams,
+                        # no_repeat_ngram_size=3,
+                        max_new_tokens=1024,
+                        use_cache=True)
 
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
@@ -138,6 +157,8 @@ def eval_model(args):
             options = options[1:] + options[:1]
             cur_option_char = cur_option_char[1:] + cur_option_char[:1]
     ans_file.close()
+    avg_num_tokens = sum(num_tokens) / len(num_tokens)
+    print(f"Average number of visual tokens: {avg_num_tokens}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -155,6 +176,9 @@ if __name__ == "__main__":
     parser.add_argument("--all-rounds", action="store_true")
     parser.add_argument("--single-pred-prompt", action="store_true")
     parser.add_argument("--lang", type=str, default="en")
+    parser.add_argument("--sparse", action="store_true", help="sparse flag")
+    parser.add_argument("--scale", type=float, default=13.5)
+    parser.add_argument("--shift", type=float, default=0)
     args = parser.parse_args()
 
     eval_model(args)

@@ -1,19 +1,23 @@
 #!/bin/bash
 
-CKPT=llava-v1.5-7b
+CKPT="llava-v1.5-7b"
+METHOD="sparsevlm"
+SCALE=$1
+SHIFT=0
+PARAM="scale_${SCALE}_shift_${SHIFT}"
 
-python3 -m llava.eval.model_vqa_loader \
-    --model-path liuhaotian/$CKPT \
+python -m llava.eval.model_vqa_loader \
+    --model-path /mnt/bn/bes-nas-zqz-lq-v6arnold6/mlx/users/zhangqizhe/huggingface/${CKPT} \
     --question-file ./playground/data/eval/pope/llava_pope_test.jsonl \
     --image-folder ./playground/data/eval/pope/val2014 \
-    --answers-file ./playground/data/eval/pope/answers/$CKPT.jsonl \
-    --temperature 0 \
-    --conv-mode vicuna_v1 \
+    --answers-file ./playground/data/eval/pope/answers/${CKPT}/${METHOD}/${PARAM}.jsonl \
     --sparse \
-    --scale 9 \
-    --bias 6
+    --scale ${SCALE} \
+    --shift ${SHIFT} \
+    --temperature 0 \
+    --conv-mode vicuna_v1
 
-python3 llava/eval/eval_pope.py \
+python llava/eval/eval_pope.py \
     --annotation-dir ./playground/data/eval/pope/coco \
     --question-file ./playground/data/eval/pope/llava_pope_test.jsonl \
-    --result-file ./playground/data/eval/pope/answers/$CKPT.jsonl
+    --result-file ./playground/data/eval/pope/answers/${CKPT}/${METHOD}/${PARAM}.jsonl

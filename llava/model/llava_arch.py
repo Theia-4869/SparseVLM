@@ -330,8 +330,7 @@ class LlavaMetaForCausalLM(ABC):
     ):
         vision_tower = self.get_vision_tower()      # CLIPVisionTower
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
-            self.model.generate_process_count += 1
-            return input_ids, position_ids, attention_mask, past_key_values, None, labels,self.image_shape,self.token_length_list,self.pre_prompt_length_list
+            return input_ids, position_ids, attention_mask, past_key_values, None, labels, 576, [], []
 
         if type(images) is list or images.ndim == 5:
             if type(images) is list:
@@ -405,12 +404,10 @@ class LlavaMetaForCausalLM(ABC):
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
         # remove the padding using attention_mask -- FIXME
-        # 决定哪些部分需要被mask掉
-        _input_ids = input_ids
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
         
-        new_input_embeds = []   # 下面那个大的for循环，也就是把pre_prompt_embedding , image_embedding , question_embedding给拼接起来
+        new_input_embeds = []   # 下面那个大的for循环，也就是把pre_prompt_embedding, image_embedding, question_embedding给拼接起来
         new_labels = []
         cur_image_idx = 0
         pre_prompt_length_list = []      # 记录哪些token是预先的prompt，这些token不进行稀疏化
@@ -424,6 +421,7 @@ class LlavaMetaForCausalLM(ABC):
                 new_labels.append(labels[batch_idx])
                 cur_image_idx += 1
                 continue
+
             # 因为他input的格式是<pre_prompt><image><question>，<image>是一个分隔符，下面这行代码是为了找到<image>的位置,如[-1, 35, 93]
             image_token_indices = [-1] + torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[0].tolist() + [cur_input_ids.shape[0]] 
             pre_prompt_length_list.append(image_token_indices[1])
@@ -448,6 +446,7 @@ class LlavaMetaForCausalLM(ABC):
                     cur_new_input_embeds.append(cur_image_features) # 之前不是没把那个<image>标识符给embedding嘛，其实就是为了这一步，把<image>标识符换成真正的image_features
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
                     # 把这个image_features对应的label全部设为IGNORE_INDEX
+            
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]    
 
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)  # 把他们拼接成一个tensor
@@ -462,14 +461,17 @@ class LlavaMetaForCausalLM(ABC):
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
 
-        # Combine them      下面这部分代码主要是，把一个batch内的input填充到相同的维度，比如有的input是[1,4096],有的是[668,4096],那么就将他们都填充到[668,4096]
+        # Combine them
+        # 下面这部分代码主要是，把一个batch内的input填充到相同的维度，比如有的input是[1,4096],有的是[668,4096],那么就将他们都填充到[668,4096]
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
-        #  用IGNORE_INDEX填充label，用0填充attention_mask和position_ids
+
+        # 用IGNORE_INDEX填充label，用0填充attention_mask和position_ids
         new_input_embeds_padded = []
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
         attention_mask = torch.zeros((batch_size, max_len), dtype=attention_mask.dtype, device=attention_mask.device)
         position_ids = torch.zeros((batch_size, max_len), dtype=position_ids.dtype, device=position_ids.device)
+
         token_length_list = []      # 这个list是为了后续把填充的token给mask掉
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
@@ -507,12 +509,8 @@ class LlavaMetaForCausalLM(ABC):
 
         if _position_ids is None:
             position_ids = None
-        self.image_shape = image_features.shape[1]
-        self.token_length_list = token_length_list
-        self.pre_prompt_length_list = pre_prompt_length_list
-        self.model.init_token_total_shape = max_len       # 这个参数用于初始化policy
-# attention_mask.shape：torch.Size([1, 668])，new_input_embeds.shape：torch.Size([1, 668, 4096])，new_labels.shape：torch.Size([1, 668])
-        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels,image_features.shape[1],token_length_list,pre_prompt_length_list
+        
+        return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels, image_features.shape[1], token_length_list, pre_prompt_length_list
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

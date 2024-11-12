@@ -1,6 +1,6 @@
 '''
 Copyright (2024) Peking University. 
-Developers: Yuan Zhang, Junpeng Ma
+Developers: Yuan Zhang, Chun-Kai Fan, Junpeng Ma
 
 Licensed under the Apache License, Version 2.0 (the "License"); 
 you may not use this file except in compliance with the License. 
@@ -15,15 +15,40 @@ See the License for the specific language governing permissions and
 limitations under the License. 
 '''
 
-import torch
-import torch.nn as nn
-
+import einops
 import math
-import einops as ein
+import torch
+
+
+def attn_postprocess_rank(self_attn_weights, v_token_start, v_token_num, t_token_start, t_token_idx, scale, shift):
+    '''
+    self_attn_weights: [B, H, L, L]
+    '''
+    self_attn_weights = self_attn_weights.mean(1) # B, L[Q], L[K]
+
+    t_token_idx = t_token_idx[1] + t_token_start
+    relation_vis_text = self_attn_weights[:, t_token_idx, v_token_start: v_token_start+v_token_num] # B, L_t, L_v
+
+    rank = torch.linalg.matrix_rank(relation_vis_text.float()) # rank
+    relation_vis_text = relation_vis_text.mean(1) # B, L_v
+
+    sparse_flag = True # layer needs sparsification or not
+    if v_token_num - rank.item() != 0:
+        if int(rank.item() * scale + shift) < v_token_num:
+            mask = torch.zeros_like(relation_vis_text, dtype=bool)
+            _, indices = torch.topk(relation_vis_text, int(rank.item() * scale + shift), dim=1)
+            mask[0][indices] = 1
+        else:
+            mask = torch.ones_like(relation_vis_text, dtype=bool)
+            sparse_flag = False
+    else:
+        mask = torch.ones_like(relation_vis_text, dtype=bool)
+        sparse_flag = False
+
+    return mask, sparse_flag, relation_vis_text
 
     
 def batch_index_select(x, idx):
-
     if len(x.size()) == 4:
         B, H, N, C = x.size()
         N_new = idx.size(1)
@@ -32,7 +57,6 @@ def batch_index_select(x, idx):
         out = x.reshape(B*N, H, C)[idx.reshape(-1)].reshape(B, H, N_new, C)
         return out
     elif len(x.size()) == 3:
-        # in this condition
         B, N, C = x.size()
         N_new = idx.size(1)
         offset = torch.arange(B, dtype=torch.long, device=x.device).view(B, 1) * N
@@ -155,16 +179,18 @@ def index_points(points, idx):
 def cluster_and_merge(x, cluster_num):
     B, N, C = x.shape
 
-    x1 = ein.rearrange(x, "b l r -> b l () r")
-    x2 = ein.rearrange(x, "b l r -> b () l r")
+    # get distance matrix
+    x1 = einops.rearrange(x, "b l r -> b l () r")
+    x2 = einops.rearrange(x, "b l r -> b () l r")
     distance = (x1 - x2).norm(dim=-1, p=2)
     dist_matrix = distance / (C ** 0.5)
+
     # get local density
     dist_nearest, index_nearest = torch.topk(dist_matrix, k=cluster_num, dim=-1, largest=False)
     density = (-(dist_nearest ** 2).mean(dim=-1)).exp()
+
     # add a little noise to ensure no tokens have the same density.
-    density = density + torch.rand(
-        density.shape, device=density.device, dtype=density.dtype) * 1e-6
+    density = density + torch.rand(density.shape, device=density.device, dtype=density.dtype) * 1e-6
 
     # get distance indicator
     mask = density[:, None, :] > density[:, :, None]

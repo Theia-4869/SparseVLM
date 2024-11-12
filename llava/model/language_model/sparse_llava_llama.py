@@ -2,43 +2,37 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-from torch.nn import CrossEntropyLoss
-import torch.nn.functional as F
 
-from transformers import AutoConfig, AutoModelForCausalLM, \
-                         LlamaConfig, LlamaModel, LlamaForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, LlamaConfig
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
+from .modelling_sparse_llama import LlamaDynamicModel, LlamaDynamicForCausalLM
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
-from .modelling_sparse_llama import LlamaDynamicvitModel, LlamaDynamicvitForCausalLM
-from .llava_llama import LlavaLlamaModel
 
 
 class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
 
 
-class LlavaLlamaDynamicModel(LlavaMetaModel, LlamaDynamicvitModel):
+class LlavaLlamaDynamicModel(LlavaMetaModel, LlamaDynamicModel):
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):
         super(LlavaLlamaDynamicModel, self).__init__(config)
 
   
-class LlavaLlamaDynamicForCausalLM(LlamaDynamicvitForCausalLM, LlavaMetaForCausalLM):
+class LlavaLlamaDynamicForCausalLM(LlamaDynamicForCausalLM, LlavaMetaForCausalLM):
     config_class = LlavaConfig
 
     def __init__(self, config):
-        LlamaDynamicvitForCausalLM.__init__(self,config)
+        LlamaDynamicForCausalLM.__init__(self,config)
         self.model = LlavaLlamaDynamicModel(config)
         self.pretraining_tp = config.pretraining_tp
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.image_shape = 576
-        self.token_length_list = []
-        self.pre_prompt_length_list = []
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -63,7 +57,7 @@ class LlavaLlamaDynamicForCausalLM(LlamaDynamicvitForCausalLM, LlavaMetaForCausa
         token_length_list = [],
         pre_prompt_length_list = [],
         scale = 13.5,
-        bias = 0.0,
+        shift = 0.0,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         if inputs_embeds is None:
@@ -98,28 +92,28 @@ class LlavaLlamaDynamicForCausalLM(LlamaDynamicvitForCausalLM, LlavaMetaForCausa
             output_attentions=output_attentions,# None
             output_hidden_states=output_hidden_states,  # None
             return_dict=return_dict,           # None
-            image_shape = image_shape,
-            token_length_list = token_length_list,
-            pre_prompt_length_list = pre_prompt_length_list,
-            scale = scale,
-            bias = bias
+            image_shape=image_shape,
+            token_length_list=token_length_list,
+            pre_prompt_length_list=pre_prompt_length_list,
+            scale=scale,
+            shift=shift
         )
 
     @torch.no_grad()
     def generate(
         self,
         scale,
-        bias,
+        shift,
         inputs: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
-        image_shape = 576,
-        token_length_list = [],
-        pre_prompt_length_list = [],
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
         attention_mask = kwargs.pop("attention_mask", None)
+        image_shape = kwargs.pop("image_shape", None)
+        token_length_list = kwargs.pop("token_length_list", None)
+        pre_prompt_length_list = kwargs.pop("pre_prompt_length_list", None)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
 
@@ -154,7 +148,7 @@ class LlavaLlamaDynamicForCausalLM(LlamaDynamicvitForCausalLM, LlavaMetaForCausa
             token_length_list=token_length_list,
             pre_prompt_length_list=pre_prompt_length_list,
             scale=scale,
-            bias=bias,
+            shift=shift,
             **kwargs
         )
 

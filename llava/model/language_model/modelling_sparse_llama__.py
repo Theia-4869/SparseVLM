@@ -17,15 +17,13 @@ limitations under the License.
 
 import copy
 import inspect
-import math
 import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
-from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import torch.nn.functional as F
 
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
@@ -42,17 +40,21 @@ from transformers.generation.stopping_criteria import (
     validate_stopping_criteria,
 )
 from transformers.generation.utils import GenerateDecoderOnlyOutput, \
-    GenerateEncoderDecoderOutput, GenerateBeamDecoderOnlyOutput, GenerateBeamEncoderDecoderOutput
+GenerateEncoderDecoderOutput,GenerateBeamDecoderOnlyOutput,GenerateBeamEncoderDecoderOutput
 if TYPE_CHECKING:
     from transformers.modeling_utils import PreTrainedModel
     from transformers.generation.streamers import BaseStreamer
 
+import math
+from typing import List, Optional, Tuple, Union
+from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from transformers import AutoConfig, AutoModelForCausalLM, \
-    LlamaConfig, LlamaModel, LlamaForCausalLM, Cache, DynamicCache
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaSdpaAttention, \
-    LlamaAttention, LlamaFlashAttention2, apply_rotary_pos_emb,repeat_kv, \
-    _prepare_4d_causal_attention_mask, _prepare_4d_causal_attention_mask_for_sdpa, \
-    LlamaRMSNorm, LlamaMLP
+                         LlamaConfig, LlamaModel, LlamaForCausalLM,LlamaPreTrainedModel,Cache,DynamicCache
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer,LlamaSdpaAttention,\
+                        LlamaAttention,LlamaFlashAttention2,apply_rotary_pos_emb,repeat_kv,\
+                        _prepare_4d_causal_attention_mask,_prepare_4d_causal_attention_mask_for_sdpa,LlamaRMSNorm,\
+                        LlamaMLP
+import warnings
 from transformers.modeling_outputs import BaseModelOutputWithPast,CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
@@ -143,7 +145,6 @@ class LlamaDynamicAttention(LlamaAttention):
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-
         # ------------------------ ADD new attn -----------------------------------
         if policy is None:
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -172,7 +173,7 @@ class LlamaDynamicAttention(LlamaAttention):
                     f" {attn_output.size()}"
                 )
         else:
-            attn = (query_states @ key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            attn = (query_states @ key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)        # 因为llama的attention代码没有缩放因子，所以我就不缩放了
             attn = softmax_with_policy(attn, policy)
             attn_output = (attn @ value_states)
 
@@ -479,14 +480,20 @@ class LlamaDynamicModel(LlamaModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-
         # ----------------------------------------Below for Sparse ----------------------------------------------
         self.layers = nn.ModuleList(
             [LlamaDynamicDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.pruning_loc = [1, 5, 14, 18] #pruning_loc
-        # ----------------------------------------Above for Sparse -----------------------------------------------
 
+        self.pruning_loc = pruning_loc
+        # for computing average token number
+        self.num_layers = config.num_hidden_layers
+        self.num_forward = 0
+        self.num_token_pool = 0
+
+        self.init_token_total_shape = 664
+        self.generate_process_count = 0
+        # ----------------------------------------Above for Sparse -----------------------------------------------
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -583,87 +590,99 @@ class LlamaDynamicModel(LlamaModel):
         # ------------------------------------------- Sparse--------------------------------------------
         assert self.training == False, 'self.training is True. Only support inference.'
         
-        num_tokens = [image_shape]
+        num_token = []
+        B, L, _ = hidden_states.shape
+        idx_sprase_layer = 0
+        out_pred_prob = None
+        init_n = self.init_token_total_shape + self.generate_process_count
+        prev_decision = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
+        policy = torch.ones(B, init_n, 1, dtype=hidden_states.dtype, device=hidden_states.device)
+
         v_token_start = pre_prompt_length_list[0] if len(pre_prompt_length_list) != 0 else 0
-        t_token_start = v_token_start + image_shape
+        text_token_start = v_token_start + image_shape
         v_token_num = image_shape
 
         # Select text raters: Section 3.2.2
-        v_t = hidden_states[:, v_token_start: t_token_start, :]
-        t_t = hidden_states[:, t_token_start: , :]
-        m_v_t = v_t @ t_t.transpose(1, 2) # [1, 576, t]
-        m_v_t = m_v_t.softmax(2).mean(1) # [1, t]
+        v_t = hidden_states[:, v_token_start: text_token_start, :]
+        t_t = hidden_states[:, text_token_start: , :]
+        m_v_t = v_t @ t_t.transpose(1, 2) # [1, 576, 53]
+        m_v_t = m_v_t.softmax(2).mean(1) # [1, 53]
         t_token_idx = torch.where(m_v_t > m_v_t.mean())
 
         for layer_idx, decoder_layer in enumerate(self.layers):
             # Sparse Layers
             if layer_idx in self.pruning_loc and len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1:
                 layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
+                        hidden_states = hidden_states,
+                        policy=None,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
                 )
 
                 attn_logits = layer_outputs[2]
 
-                pred_score_vis, sparse_flag, relation_vis_text = attn_postprocess_rank(attn_logits, v_token_start, v_token_num, \
-                    t_token_start, t_token_idx, scale=scale, shift=shift) # B, L_v
+                pred_score_vis, s_flag, relation_vis_text = attn_postprocess_rank(attn_logits, v_token_start, v_token_num, \
+                    text_token_start, t_token_idx, scale=scale, shift=shift) # B, L_v
 
-                policy = torch.ones(hidden_states.shape[0], hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
-                policy[:, v_token_start:t_token_start] = pred_score_vis.type(dtype=hidden_states.dtype)
+                policy = torch.ones(B, hidden_states.shape[1], dtype=hidden_states.dtype, device=hidden_states.device)
+                policy[:, v_token_start:text_token_start] = pred_score_vis.type(dtype = hidden_states.dtype)
 
                 for batch in range(len(pre_prompt_length_list)):
                     # keep pre prompt     
                     prompt_length = pre_prompt_length_list[batch]
                     policy[batch,:prompt_length,] = 1
                     # keep question
-                    t_token_start = prompt_length + image_shape
-                    policy[batch, t_token_start:,] = 1
+                    text_token_start = prompt_length + image_shape
+                    policy[batch, text_token_start:,] = 1
 
                 # Recycle: Section 3.3
-                if sparse_flag:
-                    total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)
-                    total_sparse_token = batch_index_select(layer_outputs[0], total_sparse_token_idx)
+                if s_flag:
+                    total_sparse_token_idx = torch.where(policy == 0)[1].unsqueeze(0)  
+                    total_sparse_token = batch_index_select(layer_outputs[0], total_sparse_token_idx) 
                     
                     merge_token_idx_stage1 = torch.where(pred_score_vis==0)[1]
                     merge_token_stage1 = relation_vis_text[0][merge_token_idx_stage1]
-                    merge_token_num_stage1 = int(merge_token_idx_stage1.shape[0] * 0.3) + 1 # Top 30%
-
-                    merge_token_idx_stage2 = merge_token_stage1.topk(merge_token_num_stage1)[1]
-                    merge_token_stage2 = total_sparse_token[:,merge_token_idx_stage2,:]
-                    cluster_num = int(merge_token_stage2.shape[1] * 0.1) + 1 # Top 10%
-                    if (cluster_num == 0):
+                    merge_token_num_stage1 = int(merge_token_idx_stage1.shape[0] * 0.3 ) + 1 # Top 30%
+                    merge_token_stage2_idx = merge_token_stage1.topk(merge_token_num_stage1)[1]
+                    
+                    merge_token_stage2 = total_sparse_token[:,merge_token_stage2_idx,:]
+                    cluster_num = int(merge_token_stage2.shape[1] / 10) + 1       # 1/10
+                    if (cluster_num == 0) :
                         cluster_num = merge_token_stage2.shape[1]
                     
-                    merge_sparse_token = cluster_and_merge(merge_token_stage2, cluster_num)
+                    merge_sparse_token = cluster_and_merge(merge_token_stage2, cluster_num)  
 
-                    select_token_idx = torch.where(policy == 1)[1].unsqueeze(0) # B, (L_s + L_v + L_t)
+                    select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # B, L_new
                     select_token = batch_index_select(layer_outputs[0], select_token_idx)
-                    select_vis_token_num = pred_score_vis.sum() # L_v
-                    select_and_merge_token = torch.cat((
-                        select_token[:,:v_token_start+select_vis_token_num,:],
-                        merge_sparse_token,
-                        select_token[:,v_token_start+select_vis_token_num:,:]
-                    ),dim=1)
+                    select_vis_token_num = pred_score_vis.sum()
+                    select_and_merge_token = torch.cat((select_token[:,:v_token_start+select_vis_token_num,:] ,
+                            merge_sparse_token,
+                            select_token[:,v_token_start+select_vis_token_num:,:])
+                            ,dim=1
+                    )
 
-                    layer_outputs = (select_and_merge_token, layer_outputs[1]) # B, (L_s + L_v + L_c + L_t), C
+                    layer_outputs = (select_and_merge_token, layer_outputs[1])  # B, L, C
                     position_ids = position_ids[:, :len(select_token_idx[0])+cluster_num]
-
+                    prev_decision = policy
                     # update
-                    v_token_num = pred_score_vis.sum().item() + cluster_num # B == 1
-                    t_token_start = v_token_start + v_token_num
+                    v_token_num = pred_score_vis.sum() + cluster_num # B == 1
+                    # print(layer_idx, v_token_num)
+                    text_token_start = v_token_start + v_token_num
                 else:
                     select_token_idx = torch.where(policy == 1)[1].unsqueeze(0)  # B, L_new
                     layer_outputs = (batch_index_select(layer_outputs[0], select_token_idx), layer_outputs[1])  # B, L, C
                     position_ids = position_ids[:, :len(select_token_idx[0])]
+                    prev_decision = policy
                     
                     # update
-                    v_token_num = pred_score_vis.sum().item() # B == 1
-                    t_token_start = v_token_start + v_token_num
-            
+                    v_token_num = pred_score_vis.sum() # B == 1
+                    # print(layer_idx, v_token_num)
+                    text_token_start = v_token_start + v_token_num
+
+                idx_sprase_layer = idx_sprase_layer + 1
             # Normal Layers
             else:
                 if output_hidden_states:
@@ -673,6 +692,7 @@ class LlamaDynamicModel(LlamaModel):
                     layer_outputs = self._gradient_checkpointing_func(
                         decoder_layer.__call__,
                         hidden_states,
+                        policy,
                         attention_mask,
                         position_ids,
                         past_key_values,
@@ -682,6 +702,7 @@ class LlamaDynamicModel(LlamaModel):
                 else:
                     layer_outputs = decoder_layer(
                         hidden_states,
+                        policy=policy,
                         attention_mask=attention_mask,
                         position_ids=position_ids,
                         past_key_value=past_key_values,
@@ -697,13 +718,15 @@ class LlamaDynamicModel(LlamaModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
 
-            if layer_idx < len(self.layers) - 1 and len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1:
-                num_tokens.append(v_token_num)
+            num_token.append(v_token_num)
         
-        if len(num_tokens) > 1:
-            equal_v_token_num = sum(num_tokens) / len(num_tokens)
-        else:
-            equal_v_token_num = None
+        if len(pre_prompt_length_list) != 0 and hidden_states.shape[1] !=1:
+            self.num_forward += 1
+            self.num_token_pool += (sum(num_token) / self.num_layers)
+            # print("equal token number utill now: ", self.num_token_pool / self.num_forward)
+        equal_v_token_num = 0#hidden_states.shape[1] + image_shape - token_length_list[0]
+        print(f"equal_v_token_num: {equal_v_token_num}")
+        print(hidden_states.shape)
 
         hidden_states = self.norm(hidden_states)
 
@@ -717,11 +740,14 @@ class LlamaDynamicModel(LlamaModel):
         if not return_dict:
             return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
 
-        return BaseModelOutputWithPast(
-            last_hidden_state=hidden_states,
-            past_key_values=next_cache,
-            hidden_states=all_hidden_states,
-            attentions=all_self_attns,
+        return (
+            prev_decision.detach(), 
+            out_pred_prob,
+                BaseModelOutputWithPast(
+                last_hidden_state=hidden_states,
+                past_key_values=next_cache,
+                hidden_states=all_hidden_states,
+                attentions=all_self_attns,)
         ), equal_v_token_num
 
 
@@ -772,6 +798,9 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
             shift=shift
         )
 
+        prev_decision = outputs[0]
+        out_pred_prob = outputs[1]
+        outputs = outputs[2]
         hidden_states = outputs[0]
         if self.config.pretraining_tp > 1:
             lm_head_slices = self.lm_head.weight.split(self.vocab_size // self.config.pretraining_tp, dim=0)
@@ -798,13 +827,15 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
 
-        return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            hidden_states=outputs.last_hidden_state,
-            attentions=outputs.attentions,
-        ), v_token_num
+        return (prev_decision,
+                out_pred_prob,
+                CausalLMOutputWithPast(
+                    loss=loss,
+                    logits=logits,
+                    past_key_values=outputs.past_key_values,
+                    hidden_states=outputs.last_hidden_state,
+                    attentions=outputs.attentions,
+                )), v_token_num
 
     @torch.no_grad()
     def generate(
@@ -819,9 +850,9 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
         streamer: Optional["BaseStreamer"] = None,
         negative_prompt_ids: Optional[torch.Tensor] = None,
         negative_prompt_attention_mask: Optional[torch.Tensor] = None,
-        image_shape = 576,
-        token_length_list = [],
-        pre_prompt_length_list = [],
+        image_shape = None,
+        token_length_list = None,
+        pre_prompt_length_list = None,
         scale = 13.5,
         shift = 0.0,
         **kwargs,
@@ -1274,7 +1305,6 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
                 synced_gpus=synced_gpus,
                 **model_kwargs,
             )
-    
     def greedy_search(
         self,
         input_ids: torch.LongTensor,
@@ -1289,9 +1319,9 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
         return_dict_in_generate: Optional[bool] = None,
         synced_gpus: bool = False,
         streamer: Optional["BaseStreamer"] = None,
-        image_shape = 576,
-        token_length_list = [],
-        pre_prompt_length_list = [],
+        image_shape = None,
+        token_length_list = None,
+        pre_prompt_length_list = None,
         scale = 13.5,
         shift = 0.0,
         **model_kwargs,
@@ -1433,7 +1463,7 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
         unfinished_sequences = torch.ones(input_ids.shape[0], dtype=torch.long, device=input_ids.device)
 
         this_peer_finished = False  # used by synced_gpus only
-        equal_v_token_num = None
+        self.model.generate_process_count = 0
         while True:
             if synced_gpus:
                 # Under synced_gpus the `forward` call must continue until all gpus complete their sequence.
@@ -1460,7 +1490,7 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
                 scale=scale,
                 shift=shift,
             )
-            equal_v_token_num = v_token_num if v_token_num is not None else equal_v_token_num
+            outputs = outputs[2]
             if synced_gpus and this_peer_finished:
                 continue  # don't waste resources running the code we don't need
 
@@ -1546,4 +1576,4 @@ class LlamaDynamicForCausalLM(LlamaForCausalLM):
                     past_key_values=model_kwargs.get("past_key_values"),
                 )
         else:
-            return input_ids, equal_v_token_num
+            return input_ids, v_token_num
